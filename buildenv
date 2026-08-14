@@ -1,0 +1,180 @@
+# bump: simplejson-version /SIMPLEJSON_VERSION="(.*)"/ https://github.com/simplejson/simplejson.git|semver:*
+SIMPLEJSON_VERSION="4.1.1"
+
+###
+### Build control file for the simplejson port
+###
+### simplejson is a JSON encoder/decoder with a C speedups extension. It has no
+### external libraries and no runtime dependencies, so the standard Python
+### build system compiles it once per interpreter.
+###
+### The C extension is optional by design: simplejson falls back to pure Python
+### when it is missing, and every functional test still passes on the fallback.
+### The check therefore asserts explicitly that the compiled encoder and
+### decoder are the ones in use.
+###
+
+export ZOPEN_PROJECT_NAME="simplejson"
+export ZOPEN_BUILD_LINE="STABLE"
+export ZOPEN_CATEGORIES="development library"
+
+export ZOPEN_STABLE_URL="https://github.com/simplejson/simplejson.git"
+export ZOPEN_STABLE_TAG="v${SIMPLEJSON_VERSION}"
+export ZOPEN_DEV_URL="https://github.com/simplejson/simplejson.git"
+
+export ZOPEN_STABLE_DEPS="check_python"
+export ZOPEN_DEV_DEPS="check_python"
+export ZOPEN_RUNTIME_DEPS="check_python"
+
+export ZOPEN_BUILD_SYSTEM="Python"
+
+zopen_get_version() {
+  echo "${SIMPLEJSON_VERSION}"
+}
+
+zopen_python_test() {
+  SIMPLEJSON_EXPECTED_VERSION="${SIMPLEJSON_VERSION}" python - <<'PYEOF'
+import os
+import sys
+import sysconfig
+
+# Exercise the installed wheel, not the source tree. simplejson keeps its
+# package at the repository root, so the build directory contains a complete,
+# importable simplejson that has no compiled extension -- and zopen-build runs
+# this with the working directory set there, with python reading the script
+# from stdin, which puts that directory on sys.path ahead of site-packages.
+#
+# realpath on both sides: /tmp is a symlink to /$SYSNAME/tmp here, so a path
+# spelled /tmp/... and a working directory of /S0W1/tmp/... are the same place
+# while abspath compares them as different.
+_here = os.path.realpath(os.getcwd())
+sys.path = [p for p in sys.path
+            if p not in ("", ".") and os.path.realpath(p) != _here]
+
+failures = 0
+total = 0
+
+
+def check(label, fn):
+    global failures, total
+    total += 1
+    try:
+        if fn():
+            print("PASS:", label)
+        else:
+            print("FAIL:", label, file=sys.stderr)
+            failures += 1
+    except Exception as exc:
+        print("FAIL:", label, "-", exc, file=sys.stderr)
+        failures += 1
+
+
+try:
+    import simplejson
+except ImportError as exc:
+    print("FAIL: import simplejson -", exc, file=sys.stderr)
+    print("simplejson FAILED to import on Python %s" % sys.version.split()[0])
+    sys.exit(1)
+
+check("imported from the installed wheel, not the source tree",
+      lambda: os.path.realpath(simplejson.__file__).startswith(
+          os.path.realpath(sysconfig.get_paths()["purelib"])))
+
+check("version is the one this port builds",
+      lambda: simplejson.__version__ == os.environ["SIMPLEJSON_EXPECTED_VERSION"])
+
+# Everything below passes on the pure Python fallback, so pin down that the
+# compiled encoder and decoder are what is loaded. c_make_encoder is the
+# _speedups Encoder class and c_scanstring its builtin; both are None when the
+# extension is absent.
+check("the C encoder is in use",
+      lambda: simplejson.encoder.c_make_encoder is not None)
+check("the C decoder is in use",
+      lambda: simplejson.decoder.c_scanstring is not None)
+
+check("round trip preserves a nested structure",
+      lambda: simplejson.loads(simplejson.dumps({"a": [1, 2.5, None, True],
+                                                 "b": {"c": "d"}}))
+      == {"a": [1, 2.5, None, True], "b": {"c": "d"}})
+
+# Non-ASCII through the C scanner. Written as escapes rather than literals:
+# this script is read from stdin on a platform whose default encoding is
+# EBCDIC, and the test should not depend on how it was transmitted.
+check("non-ascii survives a round trip",
+      lambda: simplejson.loads(simplejson.dumps({"k": "é中"}))
+      == {"k": "é中"})
+
+check("ensure_ascii escapes non-ascii",
+      lambda: simplejson.dumps("é") == '"\\u00e9"')
+check("ensure_ascii=False emits the character",
+      lambda: simplejson.dumps("é", ensure_ascii=False) == '"é"')
+
+# Decimal handling is simplejson's main reason to exist over the standard
+# library's json, and it runs through the C encoder.
+def decimals():
+    from decimal import Decimal
+    out = simplejson.dumps({"n": Decimal("1.10")}, use_decimal=True)
+    back = simplejson.loads(out, use_decimal=True)
+    return out == '{"n": 1.10}' and back["n"] == Decimal("1.10")
+
+
+check("Decimal round trip keeps precision", decimals)
+
+check("separators and sort_keys",
+      lambda: simplejson.dumps({"b": 1, "a": 2}, sort_keys=True,
+                               separators=(",", ":")) == '{"a":2,"b":1}')
+
+check("large integers survive",
+      lambda: simplejson.loads(simplejson.dumps({"n": 2**70}))["n"] == 2**70)
+
+
+def rejects_malformed():
+    try:
+        simplejson.loads('{"a": }')
+        return False
+    except simplejson.JSONDecodeError:
+        return True
+
+
+check("malformed JSON is rejected", rejects_malformed)
+
+# The wire format is ASCII regardless of the platform's own encoding, so check
+# the bytes rather than trusting str comparison.
+check("output encodes to ASCII bytes",
+      lambda: simplejson.dumps({"a": 1}).encode("utf-8")
+      == b"\x7b\x22\x61\x22\x3a\x20\x31\x7d")
+
+print()
+print("simplejson %s on Python %s  --  %d passed, %d failed" % (
+    simplejson.__version__, sys.version.split()[0], total - failures, failures))
+sys.exit(1 if failures else 0)
+PYEOF
+}
+
+zopen_check_results() {
+  dir="$1"; pfx="$2"; chk="${dir}/${pfx}_check.log"
+  # No "|| echo 0": grep -c prints 0 when nothing matches and also exits 1, so
+  # the fallback appends a second zero and the arithmetic dies with FSUM9224.
+  passed=$(grep -c "^PASS:" "${chk}" 2>/dev/null)
+  failed=$(grep -c "^FAIL:" "${chk}" 2>/dev/null)
+  passed=${passed:-0}
+  failed=${failed:-0}
+  total=$((passed + failed))
+
+  interpreters=$(grep -c "^simplejson .* on Python" "${chk}" 2>/dev/null)
+  interpreters=${interpreters:-0}
+  expected=$(echo "${ZOPEN_PYTHON_VERSIONS:-3.12 3.13 3.14}" | wc -w | tr -d ' ')
+  if [ "${interpreters}" -lt "${expected}" ]; then
+    silent=$((expected - interpreters))
+    failed=$((failed + silent))
+    total=$((total + silent))
+  fi
+
+  echo "actualFailures:${failed}"
+  echo "totalTests:${total}"
+  echo "expectedFailures:0"
+}
+
+zopen_append_to_validate_install() {
+  echo "python3 -c \"import simplejson; print('simplejson', simplejson.__version__)\""
+}
